@@ -3,6 +3,7 @@
  * These component types apply to both Voxel and GLTF models.
  */
 import * as THREE from "three";
+import { toRaw } from "vue";
 import { logger } from "@/utils/logger";
 import type {
   EntityComponent,
@@ -144,13 +145,15 @@ export function applyComponents(opts: ComponentHandlerOptions): SourceRecord {
         z: THREE.MathUtils.degToRad(speedValue.z),
       };
 
-      rotatingObjects.value.push({ mesh, speed, checkVisibility: true });
+      if (rotateComponent.parameters.isRotating !== false) {
+        rotatingObjects.value.push({ mesh, speed, checkVisibility: true });
+      }
 
       (sourceData.data as SourceModelData).setRotating = (
         isRotating: boolean
       ) => {
         const index = rotatingObjects.value.findIndex(
-          (obj) => obj.mesh === mesh
+          (obj) => toRaw(obj.mesh) === toRaw(mesh)
         );
         if (index !== -1 && !isRotating) {
           rotatingObjects.value.splice(index, 1);

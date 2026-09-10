@@ -84,15 +84,14 @@ export default defineConfig(({ mode }: ConfigEnv): UserConfig => {
       open: false,
       strictPort: true,
       proxy: {
-        ...(env.VITE_APP_API_URL
+        ...(env.VITE_APP_API_PROXY_TARGET
           ? {
-              /** 代理前缀为 /dev-api 的请求  */
-              [env.VITE_APP_API_URL]: {
+              // Browser requests stay on the local frontend origin.
+              "^/dev-api(?:/|$)": {
                 changeOrigin: true,
-                // 接口地址
-                target: env.VITE_APP_API_URL,
-                rewrite: (path) =>
-                  path.replace(new RegExp("^" + env.VITE_APP_API_URL), ""),
+                target: normalizeDevProxyTarget(env.VITE_APP_API_PROXY_TARGET),
+                rewrite: (path: string) =>
+                  path.replace(/^\/dev-api(?=\/|$)/, ""),
               },
             }
           : {}),
@@ -115,7 +114,8 @@ export default defineConfig(({ mode }: ConfigEnv): UserConfig => {
         "/__xrugc_proxy__": {
           changeOrigin: true,
           target: normalizeDevProxyTarget(
-            env.VITE_APP_UNITY_PREVIEW_PROXY_TARGET ||
+            env.VITE_APP_UNITY_ASSET_PROXY_TARGET ||
+              env.VITE_APP_UNITY_PREVIEW_PROXY_TARGET ||
               "https://webgl-preview.plugins.xrugc.com"
           ),
         },

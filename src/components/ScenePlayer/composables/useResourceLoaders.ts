@@ -402,6 +402,17 @@ export function useResourceLoaders(ctx: LoaderContext) {
                 },
               },
             });
+            if (entity.children?.components?.length) {
+              const sourceData = applyComponents({
+                mesh,
+                uuid,
+                components: entity.children.components,
+                ctx,
+              });
+              if (sourceData.type === "model") {
+                sources.set(uuid, { type: "picture", data: sourceData.data });
+              }
+            }
 
             threeScene.add(mesh);
             resolve(mesh);

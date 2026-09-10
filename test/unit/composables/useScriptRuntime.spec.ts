@@ -102,6 +102,22 @@ describe("buildScriptRuntime", () => {
       expect(audio).toBeInstanceOf(Audio);
     });
 
+    it("reuses a stoppable audio handle for repeated lookups", () => {
+      const player = makeMockPlayer();
+      vi.mocked(player.getAudioUrl).mockReturnValue("https://example.com/narration.mp3");
+      const { handleSound } = buildScriptRuntime({ value: player });
+      const audio = handleSound("guide")!;
+      expect(handleSound("guide")).toBe(audio);
+      const pause = vi.spyOn(audio, "pause").mockImplementation(() => {});
+      const stopped = vi.fn();
+      audio.addEventListener("xrugc-audio-stop", stopped);
+      audio.currentTime = 12;
+      audio.stop();
+      expect(pause).toHaveBeenCalledOnce();
+      expect(audio.currentTime).toBe(0);
+      expect(stopped).toHaveBeenCalledOnce();
+    });
+
     it("URL 不存在时返回 undefined", () => {
       const player = makeMockPlayer();
       (player.getAudioUrl as ReturnType<typeof vi.fn>).mockReturnValue(
@@ -179,7 +195,7 @@ describe("buildScriptRuntime", () => {
   });
 
   describe("sound.playTask", () => {
-    it("创建并立即执行 audio task", async () => {
+    it("只创建任务，执行时才播放一次音频", async () => {
       const player = makeMockPlayer();
       const { sound } = buildScriptRuntime({ value: player });
       const audio = new Audio();
@@ -188,8 +204,10 @@ describe("buildScriptRuntime", () => {
 
       expect(task).not.toBeNull();
       expect(task!.type).toBe("audio");
-      // playQueuedAudio should have been called
-      expect(player.playQueuedAudio).toHaveBeenCalledWith(audio);
+      expect(player.playQueuedAudio).not.toHaveBeenCalled();
+      await task!.execute?.();
+      expect(player.playQueuedAudio).toHaveBeenCalledWith(audio, true);
+      expect(player.playQueuedAudio).toHaveBeenCalledTimes(1);
     });
 
     it("audio 为 undefined 时返回 null", () => {
@@ -290,6 +308,36 @@ describe("buildScriptRuntime", () => {
   // task API
   // ----------------------------------------------------------------
   describe("task.array", () => {
+    it("SET 同时启动任务，LIST 等待上一项结束", async () => {
+      const { task } = buildScriptRuntime({ value: makeMockPlayer() });
+      const events: string[] = [];
+      let finish!: () => void;
+      const first = { execute: async () => {
+        events.push("first");
+        await new Promise<void>((resolve) => { finish = resolve; });
+        events.push("finished");
+      }};
+      const second = { execute: () => { events.push("second"); } };
+      const parallel = task.execute(task.array("SET", [first, second]));
+      expect(events).toEqual(["first", "second"]);
+      finish();
+      await parallel;
+      events.length = 0;
+      const serial = task.execute(task.array("LIST", [first, second]));
+      expect(events).toEqual(["first"]);
+      finish();
+      await serial;
+      expect(events).toEqual(["first", "finished", "second"]);
+    });
+
+    it("节点自旋转控制调用组件启停方法", () => {
+      const { point } = buildScriptRuntime({ value: makeMockPlayer() });
+      const object = { setRotating: vi.fn() };
+      point.setRotatable(object, true);
+      point.setRotatable(object, false);
+      expect(object.setRotating.mock.calls).toEqual([[true], [false]]);
+    });
+
     it("LIST 类型返回所有元素", () => {
       const { task } = buildScriptRuntime({ value: makeMockPlayer() });
       const result = task.array("LIST", [1, 2, 3]);
@@ -407,18 +455,30 @@ describe("buildScriptRuntime", () => {
 
       await task!.execute!();
 
-      expect(instance.playAnimation).toHaveBeenCalledWith("jump");
+      expect(instance.playAnimation).toHaveBeenCalledWith("jump", { loop: false });
     });
   });
 
   describe("animation.playTask", () => {
-    it("创建并立即执行 animation task", () => {
+    it("执行时才播放一次并等待动画完成", async () => {
       const { animation } = buildScriptRuntime({ value: makeMockPlayer() });
       const instance = makeMeshWrapper();
       const task = animation.playTask(instance, "idle");
 
       expect(task).not.toBeNull();
-      expect(instance.playAnimation).toHaveBeenCalledWith("idle");
+      expect(instance.playAnimation).not.toHaveBeenCalled();
+      let finish!: () => void;
+      instance.playAnimation = vi.fn(() => new Promise<void>(resolve => { finish = resolve; }));
+      const runtime = buildScriptRuntime({ value: makeMockPlayer() });
+      let complete = false;
+      const execution = runtime.task.execute(task).then(() => { complete = true; });
+      await Promise.resolve();
+      expect(instance.playAnimation).toHaveBeenCalledTimes(1);
+      expect(instance.playAnimation).toHaveBeenCalledWith("idle", { loop: false });
+      expect(complete).toBe(false);
+      finish();
+      await execution;
+      expect(complete).toBe(true);
     });
 
     it("instance 无效时返回 null", () => {
@@ -748,7 +808,7 @@ describe("buildScriptRuntime", () => {
 
       await taskObj!.execute!();
 
-      expect(player.playQueuedAudio).toHaveBeenCalledWith(audio);
+      expect(player.playQueuedAudio).toHaveBeenCalledWith(audio, true);
     });
   });
 

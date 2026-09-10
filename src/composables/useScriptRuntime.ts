@@ -10,7 +10,7 @@ import { logger } from "@/utils/logger";
 
 export type MeshWrapper = {
   mesh: THREE.Object3D;
-  playAnimation?: (animationName: string) => void;
+  playAnimation?: (animationName: string, options?: { loop?: boolean }) => void | Promise<void>;
   setText?: (text: string) => void;
   setVisibility?: (visible: boolean) => void;
 };
@@ -35,7 +35,7 @@ export type SceneSource = {
 /** ScenePlayer 暴露的最小接口 */
 export type ScenePlayerLike = {
   sources: Map<string, SceneSource | { type: string; data: unknown }>;
-  playAnimation: (uuid: string, animationName: string) => void;
+  playAnimation: (uuid: string, animationName: string, options?: { loop?: boolean }) => void | Promise<void>;
   getAudioUrl: (uuid: string) => string | undefined;
   playQueuedAudio: (
     audio: HTMLAudioElement,
@@ -79,17 +79,34 @@ export function buildScriptRuntime(
   };
 
   // ---- handleSound ----
-  const handleSound = (uuid: string): HTMLAudioElement | undefined => {
+  const audioCache = new Map<string, HTMLAudioElement & { stop: () => void }>();
+  const handleSound = (uuid: string): (HTMLAudioElement & { stop: () => void }) | undefined => {
     const audioUrl = scenePlayerRef.value?.getAudioUrl(uuid);
     if (!audioUrl) {
       logger.error(`找不到UUID为 ${uuid} 的音频资源`);
       return undefined;
     }
-    return new Audio(audioUrl);
+    const cached = audioCache.get(uuid);
+    if (cached?.getAttribute("src") === audioUrl) return cached;
+    cached?.stop();
+    const audio = new Audio(audioUrl) as HTMLAudioElement & { stop: () => void };
+    audio.stop = () => {
+      audio.pause();
+      audio.currentTime = 0;
+      // Release the scene playback queue as well as stopping the media element.
+      audio.dispatchEvent(new Event("xrugc-audio-stop"));
+    };
+    audioCache.set(uuid, audio);
+    return audio;
   };
 
   // ---- polygen API ----
   const polygen = {
+    setRotatable: (object: unknown, enabled: boolean) => {
+      if (isRecord(object) && typeof object.setRotating === "function") {
+        object.setRotating(enabled);
+      }
+    },
     playAnimation: (
       polygenInstance: MeshWrapper | null,
       animationName: string
@@ -127,17 +144,16 @@ export function buildScriptRuntime(
       return {
         type: "audio",
         execute: async () => {
-          await scenePlayerRef.value?.playQueuedAudio(audio);
+          // Task LIST/SET determines sequencing; a global queue would serialize
+          // effects intended to accompany animation or narration.
+          await scenePlayerRef.value?.playQueuedAudio(audio, true);
         },
         data: audio,
       };
     },
 
     playTask: (audio: HTMLAudioElement | undefined): TaskObject | null => {
-      const taskObj = sound.createTask(audio);
-      if (!taskObj) return null;
-      taskObj.execute?.();
-      return taskObj;
+      return sound.createTask(audio);
     },
   };
 
@@ -304,6 +320,15 @@ export function buildScriptRuntime(
         result = processArrayItems(items);
       }
       logger.log("Processed array result:", result);
+      Object.defineProperty(result, "execute", {
+        value: async () => {
+          if (type === "SET") {
+            await Promise.all(result.map((item) => task.execute(item)));
+          } else {
+            for (const item of result) await task.execute(item);
+          }
+        },
+      });
       return result;
     },
 
@@ -314,7 +339,15 @@ export function buildScriptRuntime(
         return;
       }
       if (tweenData instanceof Promise) return await tweenData;
+      if (Array.isArray(tweenData) && !("execute" in tweenData)) {
+        for (const item of tweenData) await task.execute(item);
+        return;
+      }
       if (!isRecord(tweenData)) return;
+      if (typeof tweenData.execute === "function") {
+        await tweenData.execute();
+        return;
+      }
 
       return new Promise<void>((resolve) => {
         const startTime = Date.now();
@@ -392,7 +425,7 @@ export function buildScriptRuntime(
       return {
         type: "animation",
         execute: async () => {
-          polygenInstance.playAnimation!(animationName);
+          await polygenInstance.playAnimation!(animationName, { loop: false });
         },
         data: { instance: polygenInstance, animationName },
       };
@@ -404,7 +437,6 @@ export function buildScriptRuntime(
     ): TaskObject | null => {
       const taskObj = animation.createTask(polygenInstance, animationName);
       if (!taskObj) return null;
-      taskObj.execute?.();
       return taskObj;
     },
   };
@@ -430,6 +462,7 @@ export function buildScriptRuntime(
 
   // ---- point API ----
   const point = {
+    setRotatable: polygen.setRotatable,
     setVisual: (object: unknown, setVisual: boolean) => {
       logger.error("setVisual", object, setVisual);
       if (isRecord(object) && typeof object.setVisibility === "function") {

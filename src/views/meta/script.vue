@@ -141,7 +141,7 @@
                 class="scene-exit-btn"
                 size="small"
                 type="primary"
-                @click="disabled = false"
+                @click="stopScriptPreview"
               >
                 {{ $t("common.back") }}
               </el-button>
@@ -183,11 +183,18 @@
 
 <script setup lang="ts">
 // @ts-nocheck
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import {
+  computed,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  ref,
+  watch,
+} from "vue";
 import { CopyDocument, Loading } from "@element-plus/icons-vue";
 import { logger } from "@/utils/logger";
 import { useRoute, useRouter } from "vue-router";
-import { ElMessage } from "element-plus";
+import { ElMessage, ElMessageBox } from "element-plus";
 import { getMeta, metaInfo, putMetaCode } from "@/api/v1/meta";
 import { getVerses } from "@/api/v1/verse";
 import { Message } from "@/components/Dialog";
@@ -211,6 +218,19 @@ import {
   type EditorToolbarStatus,
 } from "@/composables/useEditorVersionToolbar";
 import { useUserStore } from "@/store/modules/user";
+import {
+  registerMetaScriptWebMcpTools,
+  type MetaScriptReplaceCompletion,
+  type MetaScriptReplacePreview,
+  type MetaScriptSnapshot,
+} from "@/services/webmcp/meta-script-tools";
+import {
+  registerScriptBlockWebMcpTools,
+  type ScriptBlockBatchCompletion,
+  type ScriptBlockBatchPreview,
+} from "@/services/webmcp/script-block-tools";
+import { useScriptPreviewController } from "@/composables/useScriptPreviewController";
+import { registerScriptPreviewWebMcpTools } from "@/services/webmcp/script-preview-tools";
 
 // ---------- Meta 专有状态 ----------
 const loading = ref(false);
@@ -221,8 +241,9 @@ const id = computed(() => parseInt(route.query.id as string));
 const loader = getConfiguredGLTFLoader();
 
 type ScenePlayerExpose = {
+  sceneInstanceId: string;
   sources: Map<string, { type: string; data: unknown }>;
-  playAnimation: (uuid: string, animationName: string) => void;
+  playAnimation: (uuid: string, animationName: string, options?: { loop?: boolean }) => void | Promise<void>;
   getAudioUrl: (uuid: string) => string | undefined;
   playQueuedAudio: (
     audio: HTMLAudioElement,
@@ -231,6 +252,17 @@ type ScenePlayerExpose = {
 };
 const scenePlayer = ref<ScenePlayerExpose | null>(null);
 const test = ref<MetaResourceIndex | null>(null);
+let webMcpLifecycle: AbortController | null = null;
+let scriptBlockWebMcpLifecycle: AbortController | null = null;
+let scriptPreviewWebMcpLifecycle: AbortController | null = null;
+const pendingWebMcpRequests = new Map<
+  string,
+  {
+    resolve: (payload: Record<string, unknown>) => void;
+    reject: (error: Error) => void;
+    timer: number;
+  }
+>();
 
 // ---------- 资源解析 ----------
 const getResource = (m: metaInfo) => {
@@ -395,11 +427,328 @@ const editorContentLoading = computed(
   () => loading.value || !editorContentReady.value
 );
 
+const requireSuccessfulWebMcpResponse = (response: Record<string, unknown>) => {
+  if (response.ok !== true) {
+    throw new Error(
+      typeof response.error === "string"
+        ? response.error
+        : "Blockly 编辑器操作失败"
+    );
+  }
+  return response;
+};
+
+const requestBlocklyEditor = (
+  action: string,
+  data: Record<string, unknown> = {},
+  timeoutMs = 15000
+) =>
+  new Promise<Record<string, unknown>>((resolve, reject) => {
+    const requestId = postMessage("REQUEST", { action, ...data });
+    if (!requestId) {
+      reject(new Error("Blockly 编辑器尚未准备完成"));
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      pendingWebMcpRequests.delete(requestId);
+      reject(new Error(`Blockly 编辑器请求超时：${action}`));
+    }, timeoutMs);
+    pendingWebMcpRequests.set(requestId, { resolve, reject, timer });
+  });
+
+const handleWebMcpEditorMessage = (event: MessageEvent) => {
+  if (event.source !== editor.value?.contentWindow) return;
+  const message = event.data;
+  if (message?.type !== "RESPONSE" || typeof message.requestId !== "string") {
+    return;
+  }
+  const pending = pendingWebMcpRequests.get(message.requestId);
+  if (!pending) return;
+  window.clearTimeout(pending.timer);
+  pendingWebMcpRequests.delete(message.requestId);
+  pending.resolve((message.payload ?? {}) as Record<string, unknown>);
+};
+
+const formatMetaScriptReplaceConfirmation = (
+  preview: MetaScriptReplacePreview
+) =>
+  [
+    `确认替换实体“${preview.entityTitle}”的 Blockly 脚本吗？`,
+    `块数量：${preview.current.blockCount} → ${preview.proposed.blockCount}`,
+    `顶层流程：${preview.current.topLevelBlockCount} → ${preview.proposed.topLevelBlockCount}`,
+    `变量数量：${preview.current.variableCount} → ${preview.proposed.variableCount}`,
+    `JavaScript：${preview.current.generatedJavaScriptBytes} → ${preview.proposed.generatedJavaScriptBytes} 字节`,
+    `Lua：${preview.current.generatedLuaBytes} → ${preview.proposed.generatedLuaBytes} 字节`,
+    "候选工作区已经过 Blockly 反序列化、块规则和双语言代码生成校验",
+    "确认后将更新可见工作区，并调用平台原有保存流程",
+  ].join("\n");
+
+const registerMetaScriptTools = () => {
+  webMcpLifecycle?.abort();
+  webMcpLifecycle = registerMetaScriptWebMcpTools({
+    getContext: () => ({
+      entityId: Number.isFinite(id.value) ? id.value : null,
+      entityTitle: meta.value?.title ?? "未命名实体",
+      editable: Boolean(meta.value?.editable),
+      ready: editorContentReady.value,
+      dirty: hasUnsavedChanges.value,
+      saving: isSaving.value,
+    }),
+    getMetaScript: async ({ includeWorkspace, includeGeneratedCode }) => {
+      if (!meta.value || !Number.isFinite(meta.value.id)) {
+        throw new Error("实体脚本尚未加载完成");
+      }
+      const response = requireSuccessfulWebMcpResponse(
+        await requestBlocklyEditor("webmcp-get-meta-script", {
+          includeWorkspace,
+          includeGeneratedCode,
+        })
+      );
+      return {
+        entityId: meta.value.id,
+        entityTitle: meta.value.title,
+        workspaceVersion: String(response.workspaceVersion),
+        summary: response.summary,
+        valid: Boolean(response.valid),
+        issue: response.issue,
+        workspace: response.workspace,
+        generatedCode: response.generatedCode,
+      } as MetaScriptSnapshot;
+    },
+    validateMetaScript: async (focusIssue) => {
+      if (!meta.value || !Number.isFinite(meta.value.id)) {
+        throw new Error("实体脚本尚未加载完成");
+      }
+      const response = requireSuccessfulWebMcpResponse(
+        await requestBlocklyEditor("webmcp-validate-meta-script", {
+          focusIssue,
+        })
+      );
+      return {
+        entityId: meta.value.id,
+        entityTitle: meta.value.title,
+        workspaceVersion: String(response.workspaceVersion),
+        summary: response.summary,
+        valid: Boolean(response.valid),
+        issue: response.issue,
+      } as MetaScriptSnapshot;
+    },
+    stageMetaScriptReplace: async (workspace) => {
+      if (!meta.value || !Number.isFinite(meta.value.id)) {
+        throw new Error("实体脚本尚未加载完成");
+      }
+      if (!meta.value.editable) {
+        throw new Error("当前账号没有修改此实体脚本的权限");
+      }
+      if (!editorContentReady.value) {
+        throw new Error("Blockly 工作区尚未准备完成");
+      }
+      if (isSaving.value) throw new Error("脚本正在保存，请稍后重试");
+      if (hasUnsavedChanges.value) {
+        throw new Error("当前脚本存在未保存修改，请先保存后再创建替换预览");
+      }
+
+      const response = requireSuccessfulWebMcpResponse(
+        await requestBlocklyEditor(
+          "webmcp-stage-meta-script-replace",
+          { workspace },
+          30000
+        )
+      );
+      return {
+        entityId: meta.value.id,
+        entityTitle: meta.value.title,
+        workspaceVersion: String(response.workspaceVersion),
+        current: response.current,
+        proposed: response.proposed,
+        proposedWorkspace: response.proposedWorkspace,
+        changed: Boolean(response.changed),
+      } as MetaScriptReplacePreview;
+    },
+    confirmMetaScriptReplace: async (preview) => {
+      try {
+        await ElMessageBox.confirm(
+          formatMetaScriptReplaceConfirmation(preview),
+          "WebMCP Blockly 脚本替换",
+          {
+            confirmButtonText: t("meta.script.save"),
+            cancelButtonText: t("common.cancel"),
+            distinguishCancelAndClose: true,
+            closeOnClickModal: false,
+            closeOnPressEscape: true,
+            showCancelButton: true,
+            customClass: "script-save-confirm-box",
+          }
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    completeMetaScriptReplace: async (preview) => {
+      if (!meta.value || meta.value.id !== preview.entityId) {
+        throw new Error("当前实体已经切换，请重新创建脚本预览");
+      }
+      if (!meta.value.editable) {
+        throw new Error("当前账号没有修改此实体脚本的权限");
+      }
+      if (isSaving.value) throw new Error("脚本正在保存，请稍后重试");
+
+      const response = requireSuccessfulWebMcpResponse(
+        await requestBlocklyEditor(
+          "webmcp-complete-meta-script-replace",
+          {
+            workspaceVersion: preview.workspaceVersion,
+            workspace: preview.proposedWorkspace,
+          },
+          30000
+        )
+      );
+      if (!response.noChange) {
+        await save("manual", { suppressNoChangeInfo: true });
+      }
+      return {
+        noChange: Boolean(response.noChange),
+        entityId: meta.value.id,
+        workspaceVersion: String(response.workspaceVersion),
+        summary: response.summary,
+      } as MetaScriptReplaceCompletion;
+    },
+    onRegistrationError: (toolName, error) => {
+      logger.warn(`WebMCP tool registration failed: ${toolName}`, error);
+    },
+  });
+};
+
+const formatScriptBlockBatchConfirmation = (preview: ScriptBlockBatchPreview) =>
+  [
+    `确认修改实体“${preview.ownerTitle}”的 Blockly 积木吗？`,
+    `批量操作：${preview.operationCount} 项`,
+    `块数量：${preview.current.blockCount} → ${preview.proposed.blockCount}`,
+    `顶层流程：${preview.current.topLevelBlockCount} → ${preview.proposed.topLevelBlockCount}`,
+    `JavaScript：${preview.current.generatedJavaScriptBytes} → ${preview.proposed.generatedJavaScriptBytes} 字节`,
+    `Lua：${preview.current.generatedLuaBytes} → ${preview.proposed.generatedLuaBytes} 字节`,
+    "全部操作已在临时 Blockly 工作区执行并通过真实代码生成校验",
+    "确认后将作为一个撤销步骤更新可见工作区并保存",
+  ].join("\n");
+
+const registerScriptBlockTools = () => {
+  scriptBlockWebMcpLifecycle?.abort();
+  scriptBlockWebMcpLifecycle = registerScriptBlockWebMcpTools({
+    getContext: () => ({
+      ownerKind: "entity",
+      ownerId: Number.isFinite(id.value) ? id.value : null,
+      ownerTitle: meta.value?.title ?? "未命名实体",
+      editable: Boolean(meta.value?.editable),
+      ready: editorContentReady.value,
+      dirty: hasUnsavedChanges.value,
+      saving: isSaving.value,
+    }),
+    getBlockCatalog: async (filters) =>
+      requireSuccessfulWebMcpResponse(
+        await requestBlocklyEditor("webmcp-get-script-block-catalog", filters)
+      ),
+    getBlockStructure: async (filters) =>
+      requireSuccessfulWebMcpResponse(
+        await requestBlocklyEditor("webmcp-get-script-block-structure", filters)
+      ),
+    stageBlockBatch: async (operations) => {
+      if (!meta.value || !Number.isFinite(meta.value.id)) {
+        throw new Error("实体脚本尚未加载完成");
+      }
+      if (!meta.value.editable) {
+        throw new Error("当前账号没有修改此实体脚本的权限");
+      }
+      if (!editorContentReady.value) {
+        throw new Error("Blockly 工作区尚未准备完成");
+      }
+      if (isSaving.value) throw new Error("脚本正在保存，请稍后重试");
+      if (hasUnsavedChanges.value) {
+        throw new Error("当前脚本存在未保存修改，请先保存后再创建积木预览");
+      }
+      const response = requireSuccessfulWebMcpResponse(
+        await requestBlocklyEditor(
+          "webmcp-stage-script-block-batch",
+          { operations },
+          30000
+        )
+      );
+      return {
+        ownerKind: "entity",
+        ownerId: meta.value.id,
+        ownerTitle: meta.value.title,
+        workspaceVersion: String(response.workspaceVersion),
+        current: response.current,
+        proposed: response.proposed,
+        proposedWorkspace: response.proposedWorkspace,
+        changed: Boolean(response.changed),
+        operationCount: Number(response.operationCount),
+        results: response.results,
+      } as ScriptBlockBatchPreview;
+    },
+    confirmBlockBatch: async (preview) => {
+      try {
+        await ElMessageBox.confirm(
+          formatScriptBlockBatchConfirmation(preview),
+          "WebMCP Blockly 积木批量修改",
+          {
+            confirmButtonText: t("meta.script.save"),
+            cancelButtonText: t("common.cancel"),
+            distinguishCancelAndClose: true,
+            closeOnClickModal: false,
+            closeOnPressEscape: true,
+            showCancelButton: true,
+            customClass: "script-save-confirm-box",
+          }
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    completeBlockBatch: async (preview) => {
+      if (!meta.value || meta.value.id !== preview.ownerId) {
+        throw new Error("当前实体已经切换，请重新创建积木预览");
+      }
+      if (!meta.value.editable) {
+        throw new Error("当前账号没有修改此实体脚本的权限");
+      }
+      if (isSaving.value) throw new Error("脚本正在保存，请稍后重试");
+      const response = requireSuccessfulWebMcpResponse(
+        await requestBlocklyEditor(
+          "webmcp-complete-script-block-batch",
+          {
+            workspaceVersion: preview.workspaceVersion,
+            workspace: preview.proposedWorkspace,
+          },
+          30000
+        )
+      );
+      if (!response.noChange) {
+        await save("manual", { suppressNoChangeInfo: true });
+      }
+      return {
+        noChange: Boolean(response.noChange),
+        ownerKind: "entity",
+        ownerId: meta.value.id,
+        workspaceVersion: String(response.workspaceVersion),
+        summary: response.summary,
+      } as ScriptBlockBatchCompletion;
+    },
+    onRegistrationError: (toolName, error) => {
+      logger.warn(`WebMCP tool registration failed: ${toolName}`, error);
+    },
+  });
+};
+
 onMounted(() => {
   registerToolbar(toolbarOwner, {
     status: toolbarStatus.value,
     onOpen: openVersionDialog,
   });
+  window.addEventListener("message", handleWebMcpEditorMessage);
+  registerMetaScriptTools();
+  registerScriptBlockTools();
 });
 
 watch(toolbarStatus, (status) => {
@@ -407,6 +756,16 @@ watch(toolbarStatus, (status) => {
 });
 
 onBeforeUnmount(() => {
+  webMcpLifecycle?.abort();
+  webMcpLifecycle = null;
+  scriptBlockWebMcpLifecycle?.abort();
+  scriptBlockWebMcpLifecycle = null;
+  window.removeEventListener("message", handleWebMcpEditorMessage);
+  for (const pending of pendingWebMcpRequests.values()) {
+    window.clearTimeout(pending.timer);
+    pending.reject(new Error("实体脚本页面已经关闭"));
+  }
+  pendingWebMcpRequests.clear();
   unregisterToolbar(toolbarOwner);
 });
 
@@ -553,9 +912,9 @@ const handlePolygen = (uuid: string) => {
   }
   return {
     mesh: model,
-    playAnimation: (animationName: string) => {
+    playAnimation: (animationName: string, options?: { loop?: boolean }) => {
       logger.log("播放动画:", { uuid: modelUuid, animationName, model });
-      scenePlayer.value?.playAnimation(modelUuid, animationName);
+      return scenePlayer.value?.playAnimation(modelUuid, animationName, options);
     },
   };
 };
@@ -563,62 +922,52 @@ const handlePolygen = (uuid: string) => {
 // ---------- Meta 专有：run ----------
 import pako from "pako";
 
-const run = async () => {
-  disabled.value = true;
+type PreviewEntityNode = {
+  parameters?: { uuid?: string | number };
+  children?: { entities?: PreviewEntityNode[] };
+};
 
-  type EntityNodeLocal = {
-    children?: { entities?: EntityNodeLocal[] };
-  };
-  const countEntities = (entities: EntityNodeLocal[]): number => {
-    let count = 0;
+const getMetaPreviewResourceState = () => {
+  const data = meta.value?.data as
+    | { children?: { entities?: PreviewEntityNode[] } }
+    | undefined;
+  const expectedIds: string[] = [];
+  let expectedCount = 0;
+  const visit = (entities: PreviewEntityNode[]) => {
     for (const entity of entities) {
-      count++;
-      const childEntities = entity.children?.entities;
-      if (childEntities && childEntities.length > 0) {
-        count += countEntities(childEntities);
+      expectedCount += 1;
+      if (entity.parameters?.uuid != null) {
+        expectedIds.push(String(entity.parameters.uuid));
       }
+      visit(entity.children?.entities ?? []);
     }
-    return count;
   };
+  visit(data?.children?.entities ?? []);
+  return {
+    expectedCount,
+    expectedIds,
+    loadedIds: Array.from(scenePlayer.value?.sources?.keys() ?? []).map(String),
+  };
+};
 
-  const waitForModels = () =>
-    new Promise<void>((resolve) => {
-      const checkModels = () => {
-        const metaData = meta.value?.data;
-        const entities =
-          metaData &&
-          typeof metaData === "object" &&
-          "children" in metaData &&
-          metaData.children?.entities
-            ? metaData.children.entities
-            : undefined;
-        if (!entities || entities.length === 0) {
-          resolve();
-          return;
-        }
-        const expectedModels = countEntities(entities);
-        const loadedModels = scenePlayer.value?.sources?.size ?? 0;
-        if (loadedModels === expectedModels) {
-          logger.log("所有资源加载完成:", {
-            expected: expectedModels,
-            loaded: loadedModels,
-          });
-          resolve();
-          return;
-        }
-        logger.log("等待资源加载...", {
-          expected: expectedModels,
-          current: loadedModels,
-        });
-        setTimeout(checkModels, 100);
-      };
-      checkModels();
-    });
-
-  await waitForModels();
-  if (!JavaScriptCode.value) return;
-
+const executeMetaScriptPreview = async (signal: AbortSignal) => {
+  if (!JavaScriptCode.value.trim()) {
+    return {
+      diagnostics: [
+        {
+          level: "warning",
+          code: "EMPTY_SCRIPT",
+          message: "当前 Blockly 工作区没有生成可执行的 JavaScript",
+        },
+      ],
+    };
+  }
+  if (signal.aborted) throw signal.reason;
   window.meta = {};
+  const instanceId = scenePlayer.value?.sceneInstanceId;
+  if (!instanceId) throw new Error("预览播放器尚未初始化");
+  window.__sceneCallbacks ??= {};
+  window.__sceneCallbacks[instanceId] = window.meta;
   const {
     Vector3,
     polygen,
@@ -636,8 +985,7 @@ const run = async () => {
     argument,
   } = buildScriptRuntime(scenePlayer);
 
-  try {
-    const wrappedCode = `
+  const wrappedCode = `
         return async function(handlePolygen, polygen, handleSound, sound, THREE, task, tween, helper, animation, event, text, point, transform, Vector3, argument, handleText, handleEntity) {
           const meta = window.meta;
           const index = ${meta.value?.id};
@@ -650,34 +998,105 @@ const run = async () => {
 
         }
       `;
-    const createFunction = new Function(wrappedCode);
-    const executableFunction = createFunction();
-    await executableFunction(
-      handlePolygen,
-      polygen,
-      buildScriptRuntime(scenePlayer).handleSound,
-      sound,
-      THREE,
-      task,
-      tween,
-      helper,
-      animation,
-      event,
-      text,
-      point,
-      transform,
-      Vector3,
-      argument,
-      handleText,
-      handleEntity
-    );
-  } catch (e) {
-    logger.error("执行代码出错:", e);
-    ElMessage.error(
-      `执行代码出错: ${e instanceof Error ? e.message : String(e)}`
-    );
-  }
+  const createFunction = new Function(wrappedCode);
+  const executableFunction = createFunction();
+  await executableFunction(
+    handlePolygen,
+    polygen,
+    buildScriptRuntime(scenePlayer).handleSound,
+    sound,
+    THREE,
+    task,
+    tween,
+    helper,
+    animation,
+    event,
+    text,
+    point,
+    transform,
+    Vector3,
+    argument,
+    handleText,
+    handleEntity
+  );
+  if (signal.aborted) throw signal.reason;
 };
+
+const scriptPreviewController = useScriptPreviewController({
+  validate: async () => {
+    const response = requireSuccessfulWebMcpResponse(
+      await requestBlocklyEditor("webmcp-validate-meta-script", {
+        focusIssue: false,
+      })
+    );
+    return {
+      valid: Boolean(response.valid),
+      workspaceVersion: String(response.workspaceVersion),
+      issue: response.issue,
+    };
+  },
+  show: async () => {
+    disabled.value = true;
+    await nextTick();
+  },
+  hide: async () => {
+    if (isSceneFullscreen.value && document.fullscreenElement) {
+      await document.exitFullscreen?.();
+    }
+    isSceneFullscreen.value = false;
+    disabled.value = false;
+    window.meta = {};
+    await nextTick();
+  },
+  getResources: getMetaPreviewResourceState,
+  execute: executeMetaScriptPreview,
+  onError: (message) => ElMessage.error(`执行代码出错: ${message}`),
+});
+
+const getMetaPreviewStatus = () => ({
+  ...scriptPreviewController.snapshot(),
+  ownerKind: "entity" as const,
+  ownerId: meta.value?.id ?? null,
+  ownerTitle: meta.value?.title ?? "未命名实体",
+  visible: disabled.value,
+});
+
+const stopScriptPreview = async () => {
+  await scriptPreviewController.stop("user");
+  return getMetaPreviewStatus();
+};
+
+const run = async () => {
+  await scriptPreviewController.start(10000);
+};
+
+const registerScriptPreviewTools = () => {
+  scriptPreviewWebMcpLifecycle?.abort();
+  scriptPreviewWebMcpLifecycle = registerScriptPreviewWebMcpTools({
+    getStatus: getMetaPreviewStatus,
+    startPreview: async (timeoutMs) => {
+      if (!meta.value || !editorContentReady.value) {
+        throw new Error("实体脚本尚未加载完成");
+      }
+      await scriptPreviewController.start(timeoutMs);
+      return getMetaPreviewStatus();
+    },
+    getDiagnostics: (levels, limit) =>
+      scriptPreviewController.getDiagnostics(levels, limit),
+    stopPreview: stopScriptPreview,
+    onRegistrationError: (toolName, error) => {
+      logger.warn(`WebMCP tool registration failed: ${toolName}`, error);
+    },
+  });
+};
+
+onMounted(registerScriptPreviewTools);
+
+onBeforeUnmount(() => {
+  scriptPreviewWebMcpLifecycle?.abort();
+  scriptPreviewWebMcpLifecycle = null;
+  void scriptPreviewController.stop("page_unmount");
+});
 
 // ---------- onMounted（Meta 专有：加载 meta 数据和模型动画）----------
 onMounted(async () => {

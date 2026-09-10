@@ -21,11 +21,14 @@ defineProps<{
 const playerRef = ref<InstanceType<typeof SharedScenePlayer> | null>(null);
 
 defineExpose({
+  get sceneInstanceId() {
+    return playerRef.value?.sceneInstanceId ?? "";
+  },
   get sources() {
     return playerRef.value?.sources;
   },
-  playAnimation(uuid: string, animationName: string) {
-    return playerRef.value?.playAnimation(uuid, animationName);
+  playAnimation(uuid: string, animationName: string, options?: { loop?: boolean }) {
+    return playerRef.value?.playAnimation(uuid, animationName, options);
   },
   getAudioUrl(uuid: string) {
     return playerRef.value?.getAudioUrl(uuid);

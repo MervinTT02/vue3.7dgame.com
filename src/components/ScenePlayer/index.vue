@@ -406,6 +406,7 @@ onUnmounted(() => {
   sceneSetup.resetClock();
   sources.clear();
   mixers.clear();
+  if (window.__sceneCallbacks) delete window.__sceneCallbacks[sceneInstanceId];
 
   collisionObjects.value = [];
   rotatingObjects.value = [];

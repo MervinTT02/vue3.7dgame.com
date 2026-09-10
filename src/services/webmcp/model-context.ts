@@ -1,0 +1,62 @@
+export type WebMcpToolAnnotations = {
+  readOnlyHint?: boolean;
+  untrustedContentHint?: boolean;
+};
+
+export type WebMcpTool = {
+  name: string;
+  title?: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  annotations?: WebMcpToolAnnotations;
+  execute: (input: unknown) => unknown | Promise<unknown>;
+};
+
+type WebMcpModelContext = {
+  registerTool: (
+    tool: WebMcpTool,
+    options?: { signal?: AbortSignal }
+  ) => void | Promise<void>;
+};
+
+type WebMcpDocument = Document & {
+  readonly modelContext?: WebMcpModelContext;
+};
+
+export type WebMcpRegistrationOptions = {
+  document?: Document;
+  onRegistrationError?: (toolName: string, error: unknown) => void;
+};
+
+/**
+ * Register a page-scoped set of WebMCP tools.
+ *
+ * Unsupported browsers are intentionally a no-op. Aborting the returned
+ * controller unregisters every tool registered by this call.
+ */
+export const registerWebMcpTools = (
+  tools: WebMcpTool[],
+  options: WebMcpRegistrationOptions = {}
+): AbortController | null => {
+  const targetDocument = (options.document ??
+    (typeof document === "undefined" ? undefined : document)) as
+    | WebMcpDocument
+    | undefined;
+  const modelContext = targetDocument?.modelContext;
+
+  if (!modelContext?.registerTool) return null;
+
+  const lifecycle = new AbortController();
+
+  for (const tool of tools) {
+    try {
+      void Promise.resolve(
+        modelContext.registerTool(tool, { signal: lifecycle.signal })
+      ).catch((error) => options.onRegistrationError?.(tool.name, error));
+    } catch (error) {
+      options.onRegistrationError?.(tool.name, error);
+    }
+  }
+
+  return lifecycle;
+};

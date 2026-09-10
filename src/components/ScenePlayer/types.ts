@@ -28,6 +28,7 @@ export type ComponentParameters = {
   uuid: string;
   target?: string;
   speed?: TransformAxis;
+  isRotating?: boolean;
   magnetic?: boolean;
   scalable?: boolean;
   limit?: {

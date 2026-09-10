@@ -60,7 +60,7 @@
         class="unity-preview-frame"
         :src="src"
         allow="autoplay; fullscreen; gamepad; xr-spatial-tracking"
-        @load="$emit('frameLoad')"
+        @load="onFrameLoad"
       ></iframe>
     </div>
   </el-dialog>
@@ -70,6 +70,7 @@
 import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { Close, FullScreen, QuestionFilled } from "@element-plus/icons-vue";
+import { installLocalPreviewRequestGuard } from "@/utils/unityPreviewLocalRequests";
 
 const props = defineProps<{
   modelValue: boolean;
@@ -87,6 +88,10 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const frame = ref<HTMLIFrameElement | null>(null);
 const frameWrap = ref<HTMLElement | null>(null);
+const onFrameLoad = () => {
+  if (frame.value) installLocalPreviewRequestGuard(frame.value);
+  emit("frameLoad");
+};
 
 const visible = computed({
   get: () => props.modelValue,

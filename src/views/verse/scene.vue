@@ -57,6 +57,7 @@ import {
   type VerseData,
   type VerseMetasWithJsCode,
 } from "@/api/v1/verse";
+import { getMeta, getMetas } from "@/api/v1/meta";
 import type { JsonValue } from "@/api/v1/types/common";
 import { getPrefab } from "@/api/v1/prefab";
 import { useAppStore } from "@/store/modules/app";
@@ -90,6 +91,29 @@ import {
   readUnityPreviewVerseCode,
   UNITY_PREVIEW_VERSE_EXPAND,
 } from "@/utils/unityPreviewPayload";
+import {
+  buildSceneModuleList,
+  registerSceneEditorWebMcpTools,
+  validateScene,
+  type SceneEditorLiveState,
+} from "@/services/webmcp/scene-editor-tools";
+import type {
+  SceneEntityPlacementPreview,
+  SceneModuleTransform,
+} from "@/services/webmcp/scene-entity-placement-tools";
+import type {
+  SceneModuleTransformPatch,
+  SceneModuleTransformPreview,
+  SceneModuleTransformSnapshot,
+} from "@/services/webmcp/scene-module-transform-tools";
+import type {
+  SceneModulePropertyPatch,
+  SceneModulePropertyPreview,
+  SceneModulePropertySnapshot,
+} from "@/services/webmcp/scene-module-property-tools";
+import type { SceneModuleDeletionPreview } from "@/services/webmcp/scene-module-deletion-tools";
+import { checkSceneReadiness } from "@/services/webmcp/scene-reliability-tools";
+import type { ScenePublicationPreview } from "@/services/webmcp/scene-publication-tools";
 
 // 组件状态
 const userStore = useUserStore();
@@ -104,6 +128,8 @@ let init = false;
 const saveable = ref(false);
 let unsavedCheckPollingTimer: number | null = null;
 const editorFrameKey = ref(0);
+const editorContentReady = ref(false);
+let webMcpLifecycle: AbortController | null = null;
 const isRestoringDraft = ref(false);
 const versionDialogVisible = ref(false);
 const draftVersions = ref<ScriptDraftVersion[]>([]);
@@ -260,6 +286,48 @@ const unityPreviewFrameKey = unityPreview.frameKey;
 const unityPreviewSrc = unityPreview.src;
 const handleUnityPreviewLoad = unityPreview.handleLoad;
 const handleUnityPreviewClosed = unityPreview.handleClosed;
+
+const checkPublicationResources = async () => {
+  const report = await checkSceneReadiness({
+    getContext: () => ({
+      scene: verse.value,
+      dirty:
+        hasUnsavedChangesBeforeUnload.value ||
+        Boolean(pendingRestorePayload.value),
+      loading: verse.value === null,
+      ready: editorContentReady.value,
+    }),
+    getLiveState: getLiveSceneState,
+    readEntityForReadiness: async (entityId: number) =>
+      (await getMeta(entityId, { expand: "resources,metaCode" })).data,
+  });
+  if (!report.metadataReady)
+    throw new Error(`资源发布前检查未通过：${report.blockers.join("；")}`);
+  return report;
+};
+
+const getSceneRuntimePreviewStatus = () => {
+  const visible = unityPreview.visible.value;
+  const ready = unityPreview.ready.value;
+  const status = visible ? unityPreview.status.value : "预览已关闭";
+  let phase: "closed" | "loading" | "ready" | "running" | "attention" =
+    "loading";
+  if (!visible) phase = "closed";
+  else if (status.includes("已在 Unity 中运行")) phase = "running";
+  else if (unityPreview.failure.value || status.includes("若画面为空"))
+    phase = "attention";
+  else if (ready) phase = "ready";
+  return {
+    sceneId: Number.isFinite(id.value) ? id.value : null,
+    sceneName: verse.value?.name ?? null,
+    visible,
+    frameVisible: unityPreview.frameVisible.value,
+    ready,
+    phase,
+    status,
+    failure: unityPreview.failure.value,
+  };
+};
 
 // 监听语言变化
 watch(
@@ -620,6 +688,7 @@ const restoreDraftVersion = (draftId: string) => {
   };
   pendingRestorePayload.value = safeClone(payload);
   isRestoringDraft.value = true;
+  editorContentReady.value = false;
   editorFrameKey.value += 1;
   hasUnsavedChangesBeforeUnload.value = true;
   Message.success(t("common.scriptDraft.restoreSuccess"));
@@ -669,6 +738,57 @@ const { postStandardMessage, sendRequest, pendingRequests } =
   useIframeMessaging(editor, {
     onError: () => ElMessage.error(t("verse.view.sceneEditor.error1")),
   });
+
+const requestEditor = (
+  action: string,
+  data: Record<string, unknown> = {},
+  timeoutMs = 15000
+) =>
+  new Promise<Record<string, unknown>>((resolve, reject) => {
+    const requestId = sendRequest(action, data);
+    if (!requestId) {
+      reject(new Error("场景编辑器尚未准备完成"));
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      pendingRequests.delete(requestId);
+      reject(new Error(`场景编辑器请求超时：${action}`));
+    }, timeoutMs);
+
+    pendingRequests.set(requestId, (payload) => {
+      window.clearTimeout(timer);
+      pendingRequests.delete(requestId);
+      resolve(payload);
+    });
+  });
+
+const requireSuccessfulEditorResponse = (response: Record<string, unknown>) => {
+  if (response.ok !== true) {
+    throw new Error(
+      typeof response.error === "string" ? response.error : "场景编辑器操作失败"
+    );
+  }
+  return response;
+};
+
+const getLiveSceneState = async (): Promise<SceneEditorLiveState> => {
+  if (!editorContentReady.value) {
+    throw new Error("场景编辑器尚未加载完成");
+  }
+  const response = requireSuccessfulEditorResponse(
+    await requestEditor("webmcp-get-scene-state")
+  );
+  return {
+    verse: response.verse,
+    sceneVersion: String(response.sceneVersion || ""),
+    changed: Boolean(response.changed),
+    loading: Boolean(response.loading),
+    selectedModuleIds: Array.isArray(response.selectedModuleIds)
+      ? response.selectedModuleIds.map(String)
+      : [],
+  };
+};
 
 const confirmSaveCurrentScene = () =>
   ElMessageBox.confirm(t("common.sceneSaveConfirm.message"), "", {
@@ -872,6 +992,163 @@ const saveVerseBeforeLeave = async (
   }
 };
 
+const formatSceneVector = (value: { x: number; y: number; z: number }) =>
+  `${value.x.toFixed(3)} / ${value.y.toFixed(3)} / ${value.z.toFixed(3)}`;
+
+const formatEntityPlacementConfirmation = (
+  preview: SceneEntityPlacementPreview
+) =>
+  [
+    `确认把实体“${preview.entityTitle}”放入当前场景吗？`,
+    `实例名称：${preview.proposedTitle}`,
+    `位置：${formatSceneVector(preview.transform.position)}`,
+    `旋转：${formatSceneVector(preview.transform.rotate)}`,
+    `缩放：${formatSceneVector(preview.transform.scale)}`,
+    preview.emptyEntity ? "提醒：这个实体目前没有内容" : "",
+    "此操作会保存场景，但不会发布",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+const formatSceneModuleTransformConfirmation = (
+  preview: SceneModuleTransformPreview
+) => {
+  const lines = [`确认修改实体实例“${preview.moduleTitle}”吗？`];
+  const appendChange = (
+    label: string,
+    current: { x: number; y: number; z: number },
+    proposed: { x: number; y: number; z: number }
+  ) => {
+    if (formatSceneVector(current) !== formatSceneVector(proposed)) {
+      lines.push(
+        `${label}：${formatSceneVector(current)} → ${formatSceneVector(proposed)}`
+      );
+    }
+  };
+  appendChange("位置", preview.current.position, preview.proposed.position);
+  appendChange(
+    "旋转",
+    preview.current.rotationDegrees,
+    preview.proposed.rotationDegrees
+  );
+  appendChange("缩放", preview.current.scale, preview.proposed.scale);
+  lines.push("此操作会保存场景，但不会发布");
+  return lines.join("\n");
+};
+
+const formatSceneModulePropertyConfirmation = (
+  preview: SceneModulePropertyPreview
+) => {
+  const lines = [`确认修改实体实例“${preview.moduleTitle}”的属性吗？`];
+  if (preview.current.title !== preview.proposed.title) {
+    lines.push(`名称：${preview.current.title} → ${preview.proposed.title}`);
+  }
+  if (preview.current.visible !== preview.proposed.visible) {
+    lines.push(
+      `可见性：${preview.current.visible ? "显示" : "隐藏"} → ${
+        preview.proposed.visible ? "显示" : "隐藏"
+      }`
+    );
+  }
+  lines.push("此操作会保存场景，但不会发布");
+  return lines.join("\n");
+};
+
+const formatSceneModuleDeletionConfirmation = (
+  preview: SceneModuleDeletionPreview
+) =>
+  [
+    `确认删除实体实例“${preview.moduleTitle}”吗？`,
+    preview.entityId === null ? "" : `来源实体 ID：${preview.entityId}`,
+    `删除范围：实例本身及其 ${preview.descendantCount} 个内部对象`,
+    "删除后会立即保存场景，但不会发布；仍可在编辑器中撤销后重新保存",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+const formatScenePublicationConfirmation = (preview: ScenePublicationPreview) =>
+  [
+    `确认${preview.alreadyPublished ? "重新" : ""}发布场景“${preview.sceneName}”吗？`,
+    `发布内容：${preview.moduleCount} 个实体实例`,
+    preview.warningCount > 0
+      ? `发布前检查有 ${preview.warningCount} 条警告：${preview.warnings.join(
+          "；"
+        )}`
+      : "发布前检查没有警告",
+    "发布将创建当前已保存版本的运行快照",
+  ].join("\n");
+
+const uniqueSceneModuleTitle = (baseTitle: string, liveVerse: unknown) => {
+  const existing = new Set(
+    buildSceneModuleList(liveVerse, { limit: 500 }).modules.map(
+      (module) => module.title
+    )
+  );
+  if (!existing.has(baseTitle)) return baseTitle;
+  let suffix = 2;
+  while (existing.has(`${baseTitle} (${suffix})`)) suffix += 1;
+  return `${baseTitle} (${suffix})`;
+};
+
+const countEntityRootNodes = (data: unknown) => {
+  if (!isRecord(data)) return 0;
+  const children = isRecord(data.children) ? data.children : null;
+  return Array.isArray(children?.entities) ? children.entities.length : 0;
+};
+
+const saveWebMcpSceneMutation = async (
+  response: Record<string, unknown>,
+  messages: { success: string; failure: string }
+) => {
+  if (!isRecord(response.verse)) {
+    throw new Error("场景编辑器没有返回可保存的场景数据");
+  }
+
+  const sceneData = response.verse as VerseEditorData;
+  const payload: VerseEditorPayload = { verse: sceneData };
+  currentSaveTrigger = "manual";
+  isSavingVersion.value = true;
+  try {
+    await putVerse(id.value, {
+      data: sceneData as unknown as JsonValue,
+    });
+    verseMetasWithLuaCodeData.value = undefined;
+    verseMetasWithJsCodeData.value = undefined;
+    if (verse.value) {
+      verse.value = {
+        ...verse.value,
+        data: safeClone(sceneData) as unknown as JsonValue,
+      };
+    }
+    const savedAt = addSceneDraftVersion(payload, currentSaveTrigger);
+    pendingRestorePayload.value = null;
+    hasUnsavedChangesBeforeUnload.value = false;
+    lastSaveTrigger.value = currentSaveTrigger;
+    lastSavedAt.value = savedAt || new Date().toISOString();
+
+    try {
+      requireSuccessfulEditorResponse(
+        await requestEditor("webmcp-mark-scene-saved", {
+          expectedSceneVersion: String(response.sceneVersion || ""),
+        })
+      );
+    } catch (error) {
+      hasUnsavedChangesBeforeUnload.value = true;
+      logger.warn("WebMCP scene save acknowledgement failed", error);
+    }
+    Message.success(messages.success);
+  } catch (error) {
+    hasUnsavedChangesBeforeUnload.value = true;
+    throw new Error(
+      `${messages.failure}，但保存到服务器失败，请手动保存：${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  } finally {
+    isSavingVersion.value = false;
+  }
+};
+
 //发布场景
 const releaseVerse = async (data: unknown) => {
   const payload = data as VerseEditorPayload;
@@ -941,6 +1218,7 @@ const handleMessage = async (e: MessageEvent) => {
 
   switch (msg.type) {
     case "PLUGIN_READY":
+      editorContentReady.value = true;
       hasUnsavedChangesBeforeUnload.value = false;
       if (isRestoringDraft.value && verse.value) {
         isRestoringDraft.value = false;
@@ -954,6 +1232,18 @@ const handleMessage = async (e: MessageEvent) => {
 
     case "RESPONSE": {
       const action = payload.action as string | undefined;
+      const requestId =
+        typeof msg.requestId === "string" ? msg.requestId : undefined;
+      const requestResolver = requestId
+        ? pendingRequests.get(requestId)
+        : undefined;
+      if (requestResolver) {
+        requestResolver(payload);
+      }
+
+      if (action?.startsWith("webmcp-")) {
+        break;
+      }
 
       if (action === "save" && !payload.noChange) {
         // Original save-verse logic
@@ -1207,6 +1497,655 @@ onMounted(() => {
   unsavedCheckPollingTimer = window.setInterval(() => {
     void syncUnsavedChangesForBeforeUnload();
   }, 2000);
+
+  webMcpLifecycle = registerSceneEditorWebMcpTools({
+    getContext: () => ({
+      scene: verse.value,
+      dirty:
+        hasUnsavedChangesBeforeUnload.value ||
+        Boolean(pendingRestorePayload.value),
+      loading: verse.value === null,
+      ready: editorContentReady.value,
+    }),
+    getLiveState: getLiveSceneState,
+    searchEntities: async ({ query, page, pageSize }) => {
+      const response = await getMetas(
+        "-updated_at",
+        query,
+        page,
+        "image,author,resources",
+        "id,uuid,title,name,updated_at,image,events,resources,editable,viewable",
+        pageSize
+      );
+      const totalHeader = response.headers?.["x-pagination-total-count"];
+      const total = Number(totalHeader);
+      return {
+        items: response.data,
+        page,
+        pageSize,
+        total: Number.isFinite(total) ? total : undefined,
+      };
+    },
+    stageEntityPlacement: async ({ entityId, title, transform }) => {
+      const scene = verse.value;
+      if (!scene || !Number.isFinite(scene.id)) {
+        throw new Error("场景数据尚未加载完成");
+      }
+      if (!scene.editable || !saveable.value) {
+        throw new Error("当前账号没有修改此场景的权限");
+      }
+
+      const liveState = await getLiveSceneState();
+      const hasUnsavedChanges =
+        liveState.changed ||
+        hasUnsavedChangesBeforeUnload.value ||
+        Boolean(pendingRestorePayload.value);
+      hasUnsavedChangesBeforeUnload.value = hasUnsavedChanges;
+      if (liveState.loading) {
+        throw new Error("场景实体仍在加载，请稍后重试");
+      }
+      if (hasUnsavedChanges) {
+        throw new Error("当前场景存在未保存修改，请先保存后再创建放入预览");
+      }
+      if (!liveState.sceneVersion) {
+        throw new Error("无法读取当前场景版本，请刷新编辑器后重试");
+      }
+
+      const entityResponse = await getMeta(entityId, {
+        expand: "resources",
+      });
+      const entity = entityResponse.data;
+      if (!entity || entity.viewable === false) {
+        throw new Error("实体不存在或当前账号无权查看");
+      }
+      const entityTitle = entity.title || entity.name || `实体 ${entityId}`;
+      const proposedTitle = uniqueSceneModuleTitle(
+        title || entityTitle,
+        liveState.verse
+      );
+      return {
+        sceneId: scene.id,
+        sceneVersion: liveState.sceneVersion,
+        entityId: entity.id,
+        entityUuid: entity.uuid,
+        entityTitle,
+        entityUpdatedAt: entity.updated_at,
+        proposedTitle,
+        transform,
+        resourceCount: entity.resources?.length ?? 0,
+        emptyEntity: countEntityRootNodes(entity.data) === 0,
+      };
+    },
+    confirmEntityPlacement: async (preview) => {
+      try {
+        await ElMessageBox.confirm(
+          formatEntityPlacementConfirmation(preview),
+          "WebMCP",
+          {
+            confirmButtonText: t("common.entitySaveConfirm.confirm"),
+            cancelButtonText: t("common.entitySaveConfirm.cancel"),
+            distinguishCancelAndClose: true,
+            closeOnClickModal: false,
+            closeOnPressEscape: true,
+            showCancelButton: true,
+            customClass: "script-save-confirm-box",
+          }
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    completeEntityPlacement: async (preview) => {
+      const scene = verse.value;
+      if (!scene || scene.id !== preview.sceneId) {
+        throw new Error("当前场景已经切换，请重新创建实体放入预览");
+      }
+      if (!scene.editable || !saveable.value) {
+        throw new Error("当前账号没有修改此场景的权限");
+      }
+
+      const liveState = await getLiveSceneState();
+      if (
+        liveState.changed ||
+        Boolean(pendingRestorePayload.value) ||
+        liveState.sceneVersion !== preview.sceneVersion
+      ) {
+        throw new Error("场景在预览后已发生变化，请重新创建实体放入预览");
+      }
+
+      const entityResponse = await getMeta(preview.entityId, {
+        expand: "resources",
+      });
+      const entity = entityResponse.data;
+      if (!entity || entity.uuid !== preview.entityUuid) {
+        throw new Error("实体不存在或标识已经变化，请重新预览");
+      }
+      if (
+        preview.entityUpdatedAt &&
+        entity.updated_at &&
+        preview.entityUpdatedAt !== entity.updated_at
+      ) {
+        throw new Error("实体在预览后已被更新，请重新预览");
+      }
+
+      const response = requireSuccessfulEditorResponse(
+        await requestEditor(
+          "webmcp-complete-scene-entity-placement",
+          {
+            expectedSceneVersion: preview.sceneVersion,
+            entity,
+            title: preview.proposedTitle,
+            transform: preview.transform as SceneModuleTransform,
+          },
+          120000
+        )
+      );
+      await saveWebMcpSceneMutation(response, {
+        success: "实体已放入场景并保存，场景尚未发布",
+        failure: "实体实例已放入编辑器",
+      });
+      // Validation must include the entity just placed, before the next reload.
+      if (verse.value?.id === preview.sceneId) {
+        verse.value.metas = [
+          ...(verse.value.metas ?? []).filter((item) => item.id !== entity.id),
+          entity,
+        ];
+      }
+      return {
+        moduleId: String(response.moduleId),
+        moduleTitle: String(response.moduleTitle || preview.proposedTitle),
+        entityId: Number(response.entityId),
+        transform: response.transform as SceneModuleTransform,
+      };
+    },
+    stageModuleTransform: async (moduleId, transform) => {
+      const scene = verse.value;
+      if (!scene || !Number.isFinite(scene.id)) {
+        throw new Error("场景数据尚未加载完成");
+      }
+      if (!scene.editable || !saveable.value) {
+        throw new Error("当前账号没有修改此场景的权限");
+      }
+
+      const liveState = await getLiveSceneState();
+      const hasUnsavedChanges =
+        liveState.changed ||
+        hasUnsavedChangesBeforeUnload.value ||
+        Boolean(pendingRestorePayload.value);
+      hasUnsavedChangesBeforeUnload.value = hasUnsavedChanges;
+      if (liveState.loading) {
+        throw new Error("场景实体仍在加载，请稍后重试");
+      }
+      if (hasUnsavedChanges) {
+        throw new Error("当前场景存在未保存修改，请先保存后再创建变换预览");
+      }
+
+      const response = requireSuccessfulEditorResponse(
+        await requestEditor("webmcp-stage-scene-module-transform", {
+          moduleId,
+          transform: transform as SceneModuleTransformPatch,
+        })
+      );
+      const sceneVersion = String(response.sceneVersion || "");
+      if (!sceneVersion || sceneVersion !== liveState.sceneVersion) {
+        throw new Error("场景在读取变换时发生变化，请重新预览");
+      }
+      return {
+        sceneId: scene.id,
+        sceneVersion,
+        moduleId: String(response.moduleId),
+        moduleTitle: String(response.moduleTitle || "未命名实体实例"),
+        current: response.current as SceneModuleTransformSnapshot,
+        proposed: response.proposed as SceneModuleTransformSnapshot,
+        changed: Boolean(response.changed),
+      };
+    },
+    confirmModuleTransform: async (preview) => {
+      try {
+        await ElMessageBox.confirm(
+          formatSceneModuleTransformConfirmation(preview),
+          "WebMCP",
+          {
+            confirmButtonText: t("common.entitySaveConfirm.confirm"),
+            cancelButtonText: t("common.entitySaveConfirm.cancel"),
+            distinguishCancelAndClose: true,
+            closeOnClickModal: false,
+            closeOnPressEscape: true,
+            showCancelButton: true,
+            customClass: "script-save-confirm-box",
+          }
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    completeModuleTransform: async (preview) => {
+      const scene = verse.value;
+      if (!scene || scene.id !== preview.sceneId) {
+        throw new Error("当前场景已经切换，请重新创建实例变换预览");
+      }
+      if (!scene.editable || !saveable.value) {
+        throw new Error("当前账号没有修改此场景的权限");
+      }
+
+      const liveState = await getLiveSceneState();
+      if (
+        liveState.changed ||
+        Boolean(pendingRestorePayload.value) ||
+        liveState.sceneVersion !== preview.sceneVersion
+      ) {
+        throw new Error("场景在预览后已发生变化，请重新创建实例变换预览");
+      }
+
+      const response = requireSuccessfulEditorResponse(
+        await requestEditor("webmcp-complete-scene-module-transform", {
+          expectedSceneVersion: preview.sceneVersion,
+          moduleId: preview.moduleId,
+          expectedCurrent: preview.current,
+          proposed: preview.proposed,
+        })
+      );
+      await saveWebMcpSceneMutation(response, {
+        success: "实体实例变换已保存，场景尚未发布",
+        failure: "实体实例变换已应用到编辑器",
+      });
+      return {
+        moduleId: String(response.moduleId),
+        moduleTitle: String(response.moduleTitle || preview.moduleTitle),
+        transform: response.transform as SceneModuleTransformSnapshot,
+        noChange: Boolean(response.noChange),
+      };
+    },
+    stageModuleProperties: async (moduleId, properties) => {
+      const scene = verse.value;
+      if (!scene || !Number.isFinite(scene.id)) {
+        throw new Error("场景数据尚未加载完成");
+      }
+      if (!scene.editable || !saveable.value) {
+        throw new Error("当前账号没有修改此场景的权限");
+      }
+
+      const liveState = await getLiveSceneState();
+      const hasUnsavedChanges =
+        liveState.changed ||
+        hasUnsavedChangesBeforeUnload.value ||
+        Boolean(pendingRestorePayload.value);
+      hasUnsavedChangesBeforeUnload.value = hasUnsavedChanges;
+      if (liveState.loading) {
+        throw new Error("场景实体仍在加载，请稍后重试");
+      }
+      if (hasUnsavedChanges) {
+        throw new Error("当前场景存在未保存修改，请先保存后再创建属性预览");
+      }
+
+      const response = requireSuccessfulEditorResponse(
+        await requestEditor("webmcp-stage-scene-module-properties", {
+          moduleId,
+          properties: properties as SceneModulePropertyPatch,
+        })
+      );
+      const sceneVersion = String(response.sceneVersion || "");
+      if (!sceneVersion || sceneVersion !== liveState.sceneVersion) {
+        throw new Error("场景在读取实例属性时发生变化，请重新预览");
+      }
+      return {
+        sceneId: scene.id,
+        sceneVersion,
+        moduleId: String(response.moduleId),
+        moduleTitle: String(response.moduleTitle || "未命名实体实例"),
+        current: response.current as SceneModulePropertySnapshot,
+        proposed: response.proposed as SceneModulePropertySnapshot,
+        changed: Boolean(response.changed),
+      };
+    },
+    confirmModuleProperties: async (preview) => {
+      try {
+        await ElMessageBox.confirm(
+          formatSceneModulePropertyConfirmation(preview),
+          "WebMCP",
+          {
+            confirmButtonText: t("common.entitySaveConfirm.confirm"),
+            cancelButtonText: t("common.entitySaveConfirm.cancel"),
+            distinguishCancelAndClose: true,
+            closeOnClickModal: false,
+            closeOnPressEscape: true,
+            showCancelButton: true,
+            customClass: "script-save-confirm-box",
+          }
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    completeModuleProperties: async (preview) => {
+      const scene = verse.value;
+      if (!scene || scene.id !== preview.sceneId) {
+        throw new Error("当前场景已经切换，请重新创建实例属性预览");
+      }
+      if (!scene.editable || !saveable.value) {
+        throw new Error("当前账号没有修改此场景的权限");
+      }
+
+      const liveState = await getLiveSceneState();
+      if (
+        liveState.changed ||
+        Boolean(pendingRestorePayload.value) ||
+        liveState.sceneVersion !== preview.sceneVersion
+      ) {
+        throw new Error("场景在预览后已发生变化，请重新创建实例属性预览");
+      }
+
+      const response = requireSuccessfulEditorResponse(
+        await requestEditor("webmcp-complete-scene-module-properties", {
+          expectedSceneVersion: preview.sceneVersion,
+          moduleId: preview.moduleId,
+          expectedCurrent: preview.current,
+          proposed: preview.proposed,
+        })
+      );
+      await saveWebMcpSceneMutation(response, {
+        success: "实体实例属性已保存，场景尚未发布",
+        failure: "实体实例属性已应用到编辑器",
+      });
+      return {
+        moduleId: String(response.moduleId),
+        moduleTitle: String(response.moduleTitle || preview.proposed.title),
+        properties: response.properties as SceneModulePropertySnapshot,
+        noChange: Boolean(response.noChange),
+      };
+    },
+    stageModuleDeletion: async (moduleId) => {
+      const scene = verse.value;
+      if (!scene || !Number.isFinite(scene.id)) {
+        throw new Error("场景数据尚未加载完成");
+      }
+      if (!scene.editable || !saveable.value) {
+        throw new Error("当前账号没有修改此场景的权限");
+      }
+
+      const liveState = await getLiveSceneState();
+      const hasUnsavedChanges =
+        liveState.changed ||
+        hasUnsavedChangesBeforeUnload.value ||
+        Boolean(pendingRestorePayload.value);
+      hasUnsavedChangesBeforeUnload.value = hasUnsavedChanges;
+      if (liveState.loading) {
+        throw new Error("场景实体仍在加载，请稍后重试");
+      }
+      if (hasUnsavedChanges) {
+        throw new Error("当前场景存在未保存修改，请先保存后再创建删除预览");
+      }
+
+      const response = requireSuccessfulEditorResponse(
+        await requestEditor("webmcp-stage-scene-module-deletion", {
+          moduleId,
+        })
+      );
+      const sceneVersion = String(response.sceneVersion || "");
+      if (!sceneVersion || sceneVersion !== liveState.sceneVersion) {
+        throw new Error("场景在读取实例删除范围时发生变化，请重新预览");
+      }
+      const entityId = Number(response.entityId);
+      return {
+        sceneId: scene.id,
+        sceneVersion,
+        moduleId: String(response.moduleId),
+        moduleTitle: String(response.moduleTitle || "未命名实体实例"),
+        entityId:
+          Number.isSafeInteger(entityId) && entityId > 0 ? entityId : null,
+        visible: Boolean(response.visible),
+        descendantCount: Number(response.descendantCount) || 0,
+      };
+    },
+    confirmModuleDeletion: async (preview) => {
+      try {
+        await ElMessageBox.confirm(
+          formatSceneModuleDeletionConfirmation(preview),
+          "WebMCP 删除确认",
+          {
+            confirmButtonText: t("common.delete"),
+            cancelButtonText: t("common.entitySaveConfirm.cancel"),
+            distinguishCancelAndClose: true,
+            closeOnClickModal: false,
+            closeOnPressEscape: true,
+            showCancelButton: true,
+            type: "warning",
+            customClass: "script-save-confirm-box",
+          }
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    completeModuleDeletion: async (preview) => {
+      const scene = verse.value;
+      if (!scene || scene.id !== preview.sceneId) {
+        throw new Error("当前场景已经切换，请重新创建实例删除预览");
+      }
+      if (!scene.editable || !saveable.value) {
+        throw new Error("当前账号没有修改此场景的权限");
+      }
+
+      const liveState = await getLiveSceneState();
+      if (
+        liveState.changed ||
+        Boolean(pendingRestorePayload.value) ||
+        liveState.sceneVersion !== preview.sceneVersion
+      ) {
+        throw new Error("场景在预览后已发生变化，请重新创建实例删除预览");
+      }
+
+      const response = requireSuccessfulEditorResponse(
+        await requestEditor("webmcp-complete-scene-module-deletion", {
+          expectedSceneVersion: preview.sceneVersion,
+          moduleId: preview.moduleId,
+          expected: {
+            moduleTitle: preview.moduleTitle,
+            entityId: preview.entityId,
+            visible: preview.visible,
+            descendantCount: preview.descendantCount,
+          },
+        })
+      );
+      await saveWebMcpSceneMutation(response, {
+        success: "实体实例已删除并保存，场景尚未发布",
+        failure: "实体实例已从编辑器删除",
+      });
+      const entityId = Number(response.entityId);
+      return {
+        moduleId: String(response.moduleId),
+        moduleTitle: String(response.moduleTitle || preview.moduleTitle),
+        entityId:
+          Number.isSafeInteger(entityId) && entityId > 0 ? entityId : null,
+        removedObjectCount: Number(response.removedObjectCount) || 1,
+      };
+    },
+    stageScenePublication: async () => {
+      const scene = verse.value;
+      if (!scene || !Number.isFinite(scene.id)) {
+        throw new Error("场景数据尚未加载完成");
+      }
+      if (!scene.editable || !saveable.value) {
+        throw new Error("当前账号没有发布此场景的权限");
+      }
+
+      const liveState = await getLiveSceneState();
+      const hasUnsavedChanges =
+        liveState.changed ||
+        hasUnsavedChangesBeforeUnload.value ||
+        Boolean(pendingRestorePayload.value);
+      hasUnsavedChangesBeforeUnload.value = hasUnsavedChanges;
+      if (liveState.loading) {
+        throw new Error("场景实体仍在加载，暂时不能发布");
+      }
+      if (hasUnsavedChanges) {
+        throw new Error("当前场景存在未保存修改，请先保存后再发布");
+      }
+      if (!liveState.sceneVersion) {
+        throw new Error("无法读取当前场景版本，请刷新编辑器后重试");
+      }
+
+      const validation = validateScene(scene, liveState);
+      if (!validation.valid) {
+        throw new Error(`场景校验失败：${validation.errors.join("；")}`);
+      }
+      if (validation.moduleCount === 0) {
+        throw new Error("空场景不能发布，请先放入至少一个实体");
+      }
+      await checkPublicationResources();
+      return {
+        sceneId: scene.id,
+        sceneVersion: liveState.sceneVersion,
+        sceneName: scene.name || "未命名场景",
+        moduleCount: validation.moduleCount,
+        warningCount: validation.warnings.length,
+        warnings: validation.warnings.slice(0, 8),
+        alreadyPublished:
+          scene.verseRelease === undefined ? null : Boolean(scene.verseRelease),
+      };
+    },
+    confirmScenePublication: async (preview) => {
+      try {
+        await ElMessageBox.confirm(
+          formatScenePublicationConfirmation(preview),
+          "WebMCP 发布确认",
+          {
+            confirmButtonText: t("verse.page.list.releaseConfirm.confirm"),
+            cancelButtonText: t("verse.page.list.releaseConfirm.cancel"),
+            distinguishCancelAndClose: true,
+            closeOnClickModal: false,
+            closeOnPressEscape: true,
+            showCancelButton: true,
+            type: "warning",
+            customClass: "script-save-confirm-box",
+          }
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    completeScenePublication: async (preview) => {
+      const scene = verse.value;
+      if (!scene || scene.id !== preview.sceneId) {
+        throw new Error("当前场景已经切换，请重新执行发布前检查");
+      }
+      if (!scene.editable || !saveable.value) {
+        throw new Error("当前账号没有发布此场景的权限");
+      }
+
+      const liveState = await getLiveSceneState();
+      if (
+        liveState.loading ||
+        liveState.changed ||
+        hasUnsavedChangesBeforeUnload.value ||
+        Boolean(pendingRestorePayload.value) ||
+        liveState.sceneVersion !== preview.sceneVersion
+      ) {
+        throw new Error("场景在发布预览后发生了变化，请重新执行发布前检查");
+      }
+      const validation = validateScene(scene, liveState);
+      if (!validation.valid || validation.moduleCount === 0) {
+        throw new Error(
+          validation.errors.length > 0
+            ? `场景校验失败：${validation.errors.join("；")}`
+            : "空场景不能发布"
+        );
+      }
+
+      const readiness = await checkPublicationResources();
+      if (
+        readiness.sceneId !== preview.sceneId ||
+        readiness.sceneVersion !== preview.sceneVersion
+      ) {
+        throw new Error("资源检查期间场景发生变化，请重新执行发布前检查");
+      }
+      const snapshotResponse = await takePhoto(scene.id);
+      const snapshot = isRecord(snapshotResponse.data)
+        ? snapshotResponse.data
+        : {};
+      if (
+        !Number.isSafeInteger(Number(snapshot.id)) ||
+        Number(snapshot.id) <= 0
+      ) {
+        throw new Error(
+          "发布接口未返回有效快照标识，结果未知；请先核对服务器状态，不要重复发布"
+        );
+      }
+      const refreshedResponse = await getVerse(
+        scene.id,
+        `${VERSE_SCENE_EXPAND}, verseRelease`
+      );
+      verse.value = refreshedResponse.data;
+      ElMessage.success(t("verse.page.list.releaseConfirm.success"));
+      const snapshotId = Number(snapshot.id);
+      return {
+        sceneId: scene.id,
+        snapshotId:
+          Number.isSafeInteger(snapshotId) && snapshotId > 0
+            ? snapshotId
+            : null,
+        snapshotUuid:
+          typeof snapshot.uuid === "string" && snapshot.uuid
+            ? snapshot.uuid
+            : null,
+        published: Number.isSafeInteger(snapshotId) && snapshotId > 0,
+        verification: "server_acknowledged" as const,
+        readBackVerified: false,
+      };
+    },
+    readEntityForReadiness: async (entityId) =>
+      (await getMeta(entityId, { expand: "resources,metaCode" })).data,
+    validateForReadiness: async () =>
+      validateScene(verse.value, await getLiveSceneState()),
+    getPreviewStatus: getSceneRuntimePreviewStatus,
+    startPreview: async () => {
+      const scene = verse.value;
+      if (!scene || !Number.isFinite(scene.id)) {
+        throw new Error("场景数据尚未加载完成");
+      }
+      if (!scene.viewable) {
+        throw new Error("当前账号没有预览此场景的权限");
+      }
+
+      const liveState = await getLiveSceneState();
+      const hasUnsavedChanges =
+        liveState.changed ||
+        hasUnsavedChangesBeforeUnload.value ||
+        Boolean(pendingRestorePayload.value);
+      hasUnsavedChangesBeforeUnload.value = hasUnsavedChanges;
+      if (liveState.loading) {
+        throw new Error("场景实体仍在加载，暂时不能启动运行预览");
+      }
+      if (hasUnsavedChanges) {
+        throw new Error("运行预览读取已保存版本，请先保存当前场景修改");
+      }
+      const validation = validateScene(scene, liveState);
+      if (!validation.valid) {
+        throw new Error(`场景校验失败：${validation.errors.join("；")}`);
+      }
+      if (validation.moduleCount === 0) {
+        throw new Error("空场景不能启动运行预览");
+      }
+
+      verseMetasWithLuaCodeData.value = undefined;
+      verseMetasWithJsCodeData.value = undefined;
+      if (unityPreview.visible.value) unityPreview.close();
+      await unityPreview.open();
+      return getSceneRuntimePreviewStatus();
+    },
+    stopPreview: async () => {
+      unityPreview.close();
+      return getSceneRuntimePreviewStatus();
+    },
+    onRegistrationError: (toolName, error) => {
+      logger.warn(`WebMCP tool registration failed: ${toolName}`, error);
+    },
+  });
 });
 
 onBeforeRouteLeave(async (_to, _from, next) => {
@@ -1234,6 +2173,9 @@ watch(
 );
 
 onBeforeUnmount(() => {
+  webMcpLifecycle?.abort();
+  webMcpLifecycle = null;
+  editorContentReady.value = false;
   postStandardMessage("DESTROY");
   unregisterToolbar(toolbarOwner);
   clearAutoSaveTimer();

@@ -538,9 +538,9 @@ const handlePolygen = async (uuid: string) => {
     return null;
   }
   return {
-    playAnimation: (animationName: string) => {
+    playAnimation: (animationName: string, options?: { loop?: boolean }) => {
       logger.log("播放动画:", { uuid: modelUuid, animationName, model });
-      scenePlayer.value?.playAnimation(modelUuid, animationName);
+      return scenePlayer.value?.playAnimation(modelUuid, animationName, options);
     },
   };
 };
